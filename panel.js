@@ -88,12 +88,18 @@ async function initializeApp() {
     const errorContent = document.getElementById('errorContent');
     const loading = document.getElementById('loading');
     const loadingText = document.getElementById('loadingText');
+    const loadingProgress = document.getElementById('loadingProgress');
+    const loadingProgressFill = document.getElementById('loadingProgressFill');
+    const loadingDetail = document.getElementById('loadingDetail');
     const resultContainer = document.getElementById('result');
     const resultContent = document.getElementById('resultContent');
     
     let treeData = [];
     let allFilesFlat = []; // 扁平化的所有文件列表，用于下载
-    let selectedFiles = new Set();
+    // 同一个文件（相同 obj_token）可能同时出现在多个文件夹中（如快捷方式），
+    // 因此按树中每个文件节点的实例来记录勾选状态，而不是按 obj_token
+    let selectedFiles = new Set(); // 选中的文件节点 key
+    let fileEntries = new Map(); // key -> { node, folderPath }
 
     // 从树形结构中收集所有文件（扁平化，去重）
     function collectAllFiles(nodes, fileList = [], seenTokens = new Set()) {
@@ -113,19 +119,72 @@ async function initializeApp() {
         return fileList;
     }
 
+    let scanTimer = null; // 获取文件列表时每秒刷新已用时间
+    let scanStartTime = 0;
+    let lastScanProgress = null;
+
     function hideResults() {
         resultContainer.style.display = 'none';
         errorContainer.style.display = 'none';
         loading.style.display = 'none';
+        if (scanTimer) {
+            clearInterval(scanTimer);
+            scanTimer = null;
+        }
     }
 
     function showLoading(text = '正在处理...') {
         hideResults();
         loading.style.display = 'block';
         loadingText.textContent = text;
+        setProgress(null, '');
         loadFilesBtn.disabled = true;
         downloadBtn.disabled = true;
     }
+
+    // 更新进度条：percent 为 0~1；传 'indeterminate' 显示不确定进度的动画；传 null 隐藏进度条
+    function setProgress(percent, detail) {
+        if (percent === null) {
+            loadingProgress.style.display = 'none';
+        } else {
+            loadingProgress.style.display = 'block';
+            const indeterminate = percent === 'indeterminate';
+            loadingProgress.classList.toggle('indeterminate', indeterminate);
+            loadingProgressFill.style.width = indeterminate ? '' : `${Math.round(percent * 100)}%`;
+        }
+        loadingDetail.textContent = detail;
+    }
+
+    function formatElapsed(ms) {
+        const sec = Math.floor(ms / 1000);
+        return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+    }
+
+    function renderScanProgress() {
+        const p = lastScanProgress || { topDone: 0, topTotal: 0, folders: 0, files: 0, currentPath: '' };
+        const elapsed = formatElapsed(Date.now() - scanStartTime);
+        const lines = [`已扫描 ${p.folders} 个文件夹，发现 ${p.files} 个文件 · 已用时 ${elapsed}`];
+        if (p.currentPath) {
+            lines.push(`当前：${p.currentPath}`);
+        }
+        if (p.topTotal > 0) {
+            const done = p.topDone >= p.topTotal;
+            loadingText.textContent = done
+                ? '扫描完成，正在整理文件列表...'
+                : `正在扫描文件夹 (${p.topDone}/${p.topTotal})...`;
+            setProgress(p.topDone / p.topTotal, lines.join('\n'));
+        } else {
+            loadingText.textContent = '正在获取文件夹列表...';
+            setProgress('indeterminate', lines.join('\n'));
+        }
+    }
+
+    window.addEventListener('fileListProgress', function(event) {
+        lastScanProgress = event.detail;
+        if (scanTimer) {
+            renderScanProgress();
+        }
+    });
 
     function showError(error) {
         hideResults();
@@ -148,11 +207,13 @@ async function initializeApp() {
     // 渲染树形结构
     function renderFileList(tree) {
         treeData = tree;
+        selectedFiles.clear();
+        fileEntries.clear();
         allFilesFlat = collectAllFiles(tree);
         fileList.innerHTML = '';
         
         // 递归渲染节点
-        function renderNode(node, level = 0, container) {
+        function renderNode(node, level = 0, container, parentPath = '') {
             const item = document.createElement('div');
             item.className = 'file-item';
             item.style.paddingLeft = `${level * 20 + 8}px`;
@@ -164,6 +225,7 @@ async function initializeApp() {
                 folderContainer.dataset.folderToken = node.obj_token;
                 
                 const hasChildren = node.children && node.children.length > 0;
+                const folderPath = parentPath ? `${parentPath}/${node.name}` : node.name;
                 
                 // 展开/收起图标（只有有子节点才显示）
                 if (hasChildren) {
@@ -183,6 +245,31 @@ async function initializeApp() {
                     spacer.style.display = 'inline-block';
                     item.appendChild(spacer);
                 }
+                
+                // 文件夹复选框：勾选即选中该文件夹下的全部文件（含子文件夹）
+                const folderCheckbox = document.createElement('input');
+                folderCheckbox.type = 'checkbox';
+                folderCheckbox.className = 'folder-checkbox';
+                folderCheckbox.title = '仅下载当前文件夹内容';
+                if (!hasChildren) {
+                    folderCheckbox.disabled = true;
+                }
+                folderCheckbox.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                });
+                folderCheckbox.addEventListener('change', function() {
+                    const fileCheckboxes = folderContainer.querySelectorAll('input.file-checkbox');
+                    fileCheckboxes.forEach(cb => {
+                        if (this.checked) {
+                            selectedFiles.add(cb.value);
+                        } else {
+                            selectedFiles.delete(cb.value);
+                        }
+                    });
+                    syncCheckboxes();
+                    updateDownloadButton();
+                });
+                item.appendChild(folderCheckbox);
                 
                 // 文件夹图标
                 const folderIcon = document.createElement('span');
@@ -242,7 +329,7 @@ async function initializeApp() {
                 // 如果有子节点，递归渲染
                 if (node.children && node.children.length > 0) {
                     node.children.forEach(child => {
-                        renderNode(child, level + 1, childrenContainer);
+                        renderNode(child, level + 1, childrenContainer, folderPath);
                     });
                     folderContainer.appendChild(childrenContainer);
                 }
@@ -256,15 +343,19 @@ async function initializeApp() {
                 // 文件
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
-                checkbox.id = `file-${node.obj_token}`;
-                checkbox.value = node.obj_token;
+                checkbox.className = 'file-checkbox';
+                const fileKey = `f${fileEntries.size}`;
+                fileEntries.set(fileKey, { node, folderPath: parentPath });
+                checkbox.id = `file-${fileKey}`;
+                checkbox.value = fileKey;
                 
                 checkbox.addEventListener('change', function() {
                     if (this.checked) {
-                        selectedFiles.add(node.obj_token);
+                        selectedFiles.add(fileKey);
                     } else {
-                        selectedFiles.delete(node.obj_token);
+                        selectedFiles.delete(fileKey);
                     }
+                    syncCheckboxes();
                     updateDownloadButton();
                 });
                 
@@ -305,10 +396,11 @@ async function initializeApp() {
                     // 切换复选框状态
                     checkbox.checked = !checkbox.checked;
                     if (checkbox.checked) {
-                        selectedFiles.add(node.obj_token);
+                        selectedFiles.add(fileKey);
                     } else {
-                        selectedFiles.delete(node.obj_token);
+                        selectedFiles.delete(fileKey);
                     }
+                    syncCheckboxes();
                     updateDownloadButton();
                 });
                 
@@ -328,6 +420,7 @@ async function initializeApp() {
             renderNode(rootNode, 0, null);
         });
         
+        syncCheckboxes();
         fileCount.textContent = allFilesFlat.length;
         fileListContainer.style.display = 'block';
         downloadBtn.style.display = 'block';
@@ -346,8 +439,39 @@ async function initializeApp() {
         return typeMap[objType] || '未知';
     }
 
+    // 根据 selectedFiles 同步所有复选框状态：
+    // 文件复选框直接对应；文件夹复选框根据其下文件计算 全选/部分选中(半选)/未选
+    function syncCheckboxes() {
+        fileList.querySelectorAll('input.file-checkbox').forEach(cb => {
+            cb.checked = selectedFiles.has(cb.value);
+        });
+        fileList.querySelectorAll('.folder-container').forEach(folderContainer => {
+            const folderCheckbox = folderContainer.querySelector(':scope > .file-item > input.folder-checkbox');
+            if (!folderCheckbox) return;
+            const fileCheckboxes = folderContainer.querySelectorAll('input.file-checkbox');
+            let checkedCount = 0;
+            fileCheckboxes.forEach(cb => {
+                if (cb.checked) checkedCount++;
+            });
+            folderCheckbox.checked = fileCheckboxes.length > 0 && checkedCount === fileCheckboxes.length;
+            folderCheckbox.indeterminate = checkedCount > 0 && checkedCount < fileCheckboxes.length;
+        });
+    }
+
+    // 按显示顺序取出选中的文件；同一文件在多个文件夹中都被选中时只下载一次
+    function getFilesToDownload() {
+        const result = [];
+        const seenTokens = new Set();
+        fileEntries.forEach((entry, key) => {
+            if (!selectedFiles.has(key) || seenTokens.has(entry.node.obj_token)) return;
+            seenTokens.add(entry.node.obj_token);
+            result.push(entry);
+        });
+        return result;
+    }
+
     function updateDownloadButton() {
-        const count = selectedFiles.size;
+        const count = getFilesToDownload().length;
         if (count > 0) {
             downloadBtn.textContent = `下载选中文件 (${count})`;
             downloadBtn.disabled = false;
@@ -360,6 +484,10 @@ async function initializeApp() {
     // 获取所有文件
     loadFilesBtn.addEventListener('click', async function() {
         showLoading('正在获取文件列表...');
+        scanStartTime = Date.now();
+        lastScanProgress = null;
+        renderScanProgress();
+        scanTimer = setInterval(renderScanProgress, 1000);
 
         try {
             // 通过window事件请求文件列表（content.js会监听）
@@ -384,41 +512,18 @@ async function initializeApp() {
 
     // 全选
     selectAllBtn.addEventListener('click', function() {
-        const checkboxes = fileList.querySelectorAll('input[type="checkbox"]');
-        checkboxes.forEach(cb => {
-            cb.checked = true;
-            selectedFiles.add(cb.value);
-        });
+        fileEntries.forEach((entry, key) => selectedFiles.add(key));
+        syncCheckboxes();
         updateDownloadButton();
     });
 
     // 全不选
     selectNoneBtn.addEventListener('click', function() {
-        const checkboxes = fileList.querySelectorAll('input[type="checkbox"]');
-        checkboxes.forEach(cb => {
-            cb.checked = false;
-        });
         selectedFiles.clear();
+        syncCheckboxes();
         updateDownloadButton();
     });
     
-    // 从树形结构中获取文件的完整路径
-    function getFilePathFromTree(nodes, objToken, fileName, currentPath = '') {
-        for (const node of nodes) {
-            const nodePath = currentPath ? `${currentPath}/${node.name}` : node.name;
-            
-            if (node.type === 'file' && node.obj_token === objToken) {
-                // 找到文件，返回路径
-                return nodePath.endsWith(fileName) ? nodePath : `${nodePath}/${fileName}`;
-            } else if (node.type === 'folder' && node.children) {
-                // 递归查找
-                const found = getFilePathFromTree(node.children, objToken, fileName, nodePath);
-                if (found) return found;
-            }
-        }
-        return fileName; // 如果找不到，返回文件名
-    }
-
     // 批量下载
     downloadBtn.addEventListener('click', async function() {
         // 再次检查库是否已加载
@@ -434,28 +539,31 @@ async function initializeApp() {
             return;
         }
 
-        const filesToDownload = allFilesFlat.filter(file => selectedFiles.has(file.obj_token));
+        const filesToDownload = getFilesToDownload();
         console.log('[下载] 选中的文件数量:', selectedFiles.size);
         console.log('[下载] 所有文件数量:', allFilesFlat.length);
         console.log('[下载] 要下载的文件数量:', filesToDownload.length);
-        console.log('[下载] 要下载的文件列表:', filesToDownload.map(f => f.name));
-        console.log('[下载] 选中的obj_token:', Array.from(selectedFiles));
+        console.log('[下载] 要下载的文件列表:', filesToDownload.map(e => e.node.name));
         
-        if (filesToDownload.length !== selectedFiles.size) {
-            console.warn('[下载] 警告：要下载的文件数量与选中的数量不一致！');
-        }
-        
-        showLoading(`正在下载 ${filesToDownload.length} 个文件...`);
+        await downloadEntries(filesToDownload, false);
+    });
+
+    // 下载一批文件并打包；isRetry 表示是重试上一次失败的文件
+    async function downloadEntries(filesToDownload, isRetry) {
+        showLoading(`正在${isRetry ? '重试' : '下载'} ${filesToDownload.length} 个文件...`);
 
         try {
             const zip = new JSZip();
             let successCount = 0;
-            let failCount = 0;
+            const failedFiles = []; // { path, reason, entry }
 
             // 批量下载文件（按顺序下载）
             for (let i = 0; i < filesToDownload.length; i++) {
-                const file = filesToDownload[i];
-                loadingText.textContent = `正在下载 ${i + 1}/${filesToDownload.length}: ${file.name}`;
+                const { node: file, folderPath } = filesToDownload[i];
+                const displayPath = folderPath ? `${folderPath}/${file.name}` : file.name;
+                loadingText.textContent = `正在${isRetry ? '重试' : '下载'} ${i + 1}/${filesToDownload.length}: ${file.name}`;
+                setProgress(i / filesToDownload.length,
+                    `已完成 ${i}/${filesToDownload.length}，成功 ${successCount} 个，失败 ${failedFiles.length} 个`);
                 
                 try {
                     // 等待下载完成（通过window事件）
@@ -484,7 +592,7 @@ async function initializeApp() {
                         // 超时处理
                         setTimeout(() => {
                             window.removeEventListener('fileDownloaded', handler);
-                            resolve({ success: false, error: '下载超时' });
+                            resolve({ success: false, error: '下载超时：5 分钟内未完成' });
                         }, 300000); // 5分钟超时
                     });
                     
@@ -497,51 +605,109 @@ async function initializeApp() {
                             arrayBuffer[j] = binaryString.charCodeAt(j);
                         }
                         
-                        const extension = getFileExtension(file.obj_type);
-                        // 使用原始文件名，如果已经有扩展名就保留，否则添加扩展名
+                        // 优先使用飞书导出结果返回的扩展名
+                        const extension = response.type || getFileExtension(file.obj_type);
+                        // 文件名还没有对应扩展名时补上（名字里本身带点的，如“v1.2 报告”，也能正确补全）
                         let fileName = file.name;
-                        if (!fileName.includes('.')) {
+                        if (!fileName.toLowerCase().endsWith(`.${extension.toLowerCase()}`)) {
                             fileName = `${fileName}.${extension}`;
                         }
                         
-                        // 从树形结构中获取完整路径
-                        const fullPath = getFilePathFromTree(treeData, file.obj_token, fileName);
+                        // 直接放在所在文件夹下：文件夹/报告.docx
+                        const fullPath = getUniquePath(zip, folderPath ? `${folderPath}/${fileName}` : fileName);
                         
                         zip.file(fullPath, arrayBuffer);
                         successCount++;
                         console.log(`文件 ${fullPath} 已添加到压缩包`);
                     } else {
-                        failCount++;
-                        console.error(`下载文件失败: ${file.name}`, response?.error);
+                        const reason = response?.error || '未知原因';
+                        failedFiles.push({ path: displayPath, reason, entry: filesToDownload[i] });
+                        console.error(`下载文件失败: ${displayPath}`, reason);
                     }
                 } catch (error) {
-                    failCount++;
-                    console.error(`处理文件 ${file.name} 时出错:`, error);
+                    failedFiles.push({ path: displayPath, reason: `处理文件时出错：${error.message || error}`, entry: filesToDownload[i] });
+                    console.error(`处理文件 ${displayPath} 时出错:`, error);
                 }
             }
 
-            // 生成zip文件
-            loadingText.textContent = '正在生成压缩包...';
-            const content = await zip.generateAsync({ type: 'blob' });
+            // 有失败的文件时，在压缩包中附上失败清单
+            if (failedFiles.length > 0) {
+                const report = failedFiles
+                    .map((f, idx) => `${idx + 1}. ${f.path}\n   原因：${f.reason}`)
+                    .join('\n\n');
+                zip.file('下载失败清单.txt', `共 ${failedFiles.length} 个文件下载失败：\n\n${report}\n`);
+            }
             
-            // 保存文件
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-            saveAs(content, `飞书文件批量下载-${timestamp}.zip`);
+            // 全部失败时不生成压缩包
+            if (successCount > 0) {
+                loadingText.textContent = '正在生成压缩包...';
+                setProgress(1, `已完成 ${filesToDownload.length}/${filesToDownload.length}，成功 ${successCount} 个，失败 ${failedFiles.length} 个`);
+                const content = await zip.generateAsync({ type: 'blob' });
+                
+                // 保存文件
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+                saveAs(content, `飞书文件批量下载${isRetry ? '-重试' : ''}-${timestamp}.zip`);
+            }
+            
+            const allFailed = successCount === 0;
+            const statusColor = allFailed ? '#dc2626' : (failedFiles.length > 0 ? '#d97706' : '#10b981');
+            const statusIcon = allFailed ? '✗' : (failedFiles.length > 0 ? '!' : '✓');
+            const statusText = allFailed ? '全部下载失败' : (failedFiles.length > 0 ? '部分文件下载失败' : '下载完成');
+            const zipNote = isRetry ? '（本次压缩包只包含重试成功的文件）' : '';
+            
+            const failedListHtml = failedFiles.length === 0 ? '' : `
+                <div class="failed-list">
+                    <div class="failed-list-title">失败的文件（${failedFiles.length} 个）${allFailed ? '' : '，清单已一并放入压缩包的「下载失败清单.txt」'}：</div>
+                    ${failedFiles.map(f => `
+                        <div class="failed-item">
+                            <div class="failed-item-path">${escapeHtml(f.path)}</div>
+                            <div class="failed-item-reason">${escapeHtml(f.reason)}</div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
             
             showResult(`
                 <div style="text-align: center; padding: 10px;">
-                    <div style="font-size: 48px; margin-bottom: 10px; color: #10b981;">✓</div>
-                    <div style="color: #10b981; font-weight: 600; margin-bottom: 8px; font-size: 16px;">下载完成</div>
+                    <div style="font-size: 48px; margin-bottom: 10px; color: ${statusColor};">${statusIcon}</div>
+                    <div style="color: ${statusColor}; font-weight: 600; margin-bottom: 8px; font-size: 16px;">${statusText}</div>
                     <div style="color: #666; font-size: 13px; margin-top: 5px;">
                         成功: ${successCount} 个<br>
-                        ${failCount > 0 ? `失败: ${failCount} 个` : ''}
+                        ${failedFiles.length > 0 ? `失败: ${failedFiles.length} 个` : ''}
+                        ${successCount > 0 ? `<br>${zipNote}` : ''}
                     </div>
                 </div>
+                ${failedFiles.length > 0 ? `<button id="retryFailedBtn" class="btn-primary">重试失败的文件 (${failedFiles.length})</button>` : ''}
+                ${failedListHtml}
             `);
+            
+            if (failedFiles.length > 0) {
+                const retryEntries = failedFiles.map(f => f.entry);
+                document.getElementById('retryFailedBtn').addEventListener('click', () => {
+                    downloadEntries(retryEntries, true);
+                });
+            }
         } catch (error) {
             showError('下载过程中发生错误: ' + error.message);
         }
-    });
+    }
+
+    // 同一文件夹下有同名文件时，加上序号避免在压缩包中互相覆盖：报告.docx → 报告 (2).docx
+    function getUniquePath(zip, path) {
+        if (!zip.file(path)) return path;
+        const dotIndex = path.lastIndexOf('.');
+        const base = dotIndex > path.lastIndexOf('/') ? path.slice(0, dotIndex) : path;
+        const ext = dotIndex > path.lastIndexOf('/') ? path.slice(dotIndex) : '';
+        let n = 2;
+        while (zip.file(`${base} (${n})${ext}`)) n++;
+        return `${base} (${n})${ext}`;
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
 
     function getFileExtension(objType) {
         const extMap = {

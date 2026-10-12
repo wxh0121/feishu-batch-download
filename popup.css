@@ -271,3 +271,75 @@
     font-size: 14px;
 }
 
+
+#feishu-download-panel .failed-list {
+    margin-top: 12px;
+    max-height: 240px;
+    overflow-y: auto;
+    text-align: left;
+}
+
+#feishu-download-panel .failed-list-title {
+    color: #dc2626;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+
+#feishu-download-panel .failed-item {
+    padding: 8px;
+    margin-bottom: 6px;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 4px;
+}
+
+#feishu-download-panel .failed-item-path {
+    color: #333;
+    font-size: 13px;
+    font-weight: 500;
+    word-break: break-all;
+}
+
+#feishu-download-panel .failed-item-reason {
+    color: #dc2626;
+    font-size: 12px;
+    margin-top: 4px;
+    word-break: break-all;
+}
+
+#feishu-download-panel .progress-bar {
+    position: relative;
+    height: 8px;
+    margin: 12px 0 8px;
+    background: #e5e7eb;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+#feishu-download-panel .progress-bar-fill {
+    height: 100%;
+    width: 0;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border-radius: 4px;
+    transition: width 0.3s ease;
+}
+
+#feishu-download-panel .progress-bar.indeterminate .progress-bar-fill {
+    position: absolute;
+    width: 30%;
+    animation: progressIndeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes progressIndeterminate {
+    0% { left: -30%; }
+    100% { left: 100%; }
+}
+
+#feishu-download-panel .loading-detail {
+    color: #888;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-line;
+    word-break: break-all;
+}

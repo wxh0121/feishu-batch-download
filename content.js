@@ -93,6 +93,34 @@ function getFileExtensionByObjType(obj_type) {
 }
 
 // 获取导出结果（使用与参考代码相同的API端点）
+// 把 HTTP 状态码翻译成可读的失败原因
+function describeHttpError(status) {
+    let reason = '请求失败';
+    if (status === 401 || status === 403) {
+        reason = '没有权限或登录已失效';
+    } else if (status === 404) {
+        reason = '文件不存在或已被删除';
+    } else if (status === 429) {
+        reason = '请求过于频繁，被飞书限流';
+    } else if (status >= 500) {
+        reason = '飞书服务器错误';
+    }
+    return `${reason}（HTTP ${status}）`;
+}
+
+// 飞书导出任务 job_status 对应的失败原因
+const EXPORT_JOB_ERRORS = {
+    3: '飞书内部错误',
+    107: '文档过大，无法导出',
+    108: '飞书处理超时',
+    109: '飞书内部错误',
+    110: '没有导出权限（文档所有者可能禁止了导出/下载）',
+    111: '文档已被删除',
+    122: '文档禁止导出',
+    123: '文档不存在',
+    6000: '文档中图片过多，无法导出'
+};
+
 async function fetchExportResult(ticket, token, obj_type) {
     console.log(`[fetchExportResult] fetching export result for ticket: ${ticket}`);
     
@@ -117,7 +145,7 @@ async function fetchExportResult(ticket, token, obj_type) {
         
         if (!resp.ok) {
             console.error(`[fetchExportResult] HTTP error! status: ${resp.status}`);
-            throw new Error(`HTTP error! status: ${resp.status}`);
+            throw new Error(`查询导出结果失败：${describeHttpError(resp.status)}`);
         }
         
         const json = await resp.json();
@@ -133,6 +161,10 @@ async function fetchExportResult(ticket, token, obj_type) {
 async function createExportTask(data) {
     console.log('[createExportTask] creating export task with data:', data);
     try {
+        if (!getFileTypeByObjType(data.obj_type)) {
+            throw new Error(`暂不支持导出该类型的文件（obj_type=${data.obj_type}），目前只支持导出飞书云文档、表格、多维表格、幻灯片和思维笔记`);
+        }
+        
         await sleep(500);
         const requestId = 'bbAtOlQGYEbs-' + uuidv4().replace(/-/g, '');
         
@@ -174,12 +206,17 @@ async function createExportTask(data) {
         
         if (!resp.ok) {
             console.error(`[createExportTask] HTTP error! status: ${resp.status}`);
-            throw new Error(`HTTP error! status: ${resp.status}`);
+            throw new Error(`创建导出任务失败：${describeHttpError(resp.status)}`);
         }
         
         let json = await resp.json();
         console.log('[createExportTask] response:', json);
         const ticket = json?.data?.ticket || null;
+        if (!ticket) {
+            const msg = json?.msg || json?.message || '飞书未返回导出任务';
+            const code = json?.code ? `（错误码 ${json.code}）` : '';
+            throw new Error(`创建导出任务失败：${msg}${code}`);
+        }
         console.log(`[createExportTask] created task with ticket: ${ticket}`);
         return ticket;
     } catch (error) {
@@ -204,7 +241,7 @@ async function download(url, type) {
         
         if (!response.ok) {
             console.error(`[download] HTTP error! status: ${response.status}`);
-            throw new Error(`HTTP error! status: ${response.status}`);
+            throw new Error(describeHttpError(response.status));
         }
         
         const blob = await response.blob();
@@ -226,15 +263,33 @@ async function waitForExportResult(ticket, token, obj_type) {
     
     let file_token;
     let resp;
+    let lastError = '';
+    const maxRetries = 60;
     
-    for (let retryCount = 0; retryCount < 15 && !file_token; retryCount++) {
+    for (let retryCount = 0; retryCount < maxRetries && !file_token; retryCount++) {
         console.log(`[waitForExportResult] retry count: ${retryCount}`);
         await sleep(1000);
         
         try {
             resp = await fetchExportResult(ticket, token, obj_type);
             file_token = resp?.data?.result?.file_token;
+            
+            // 导出任务明确失败时立即停止重试，并给出原因
+            const jobStatus = resp?.data?.result?.job_status;
+            if (!file_token && jobStatus !== undefined && ![0, 1, 2].includes(jobStatus)) {
+                const reason = EXPORT_JOB_ERRORS[jobStatus] || '导出失败';
+                const detail = resp?.data?.result?.job_error_msg;
+                throw Object.assign(
+                    new Error(`${reason}${detail ? `：${detail}` : ''}（job_status=${jobStatus}）`),
+                    { fatal: true }
+                );
+            }
+            if (resp?.code) {
+                lastError = `${resp.msg || '查询导出结果出错'}（错误码 ${resp.code}）`;
+            }
         } catch (error) {
+            if (error.fatal) throw error;
+            lastError = error.message;
             console.error(`[waitForExportResult] error on retry ${retryCount}:`, error);
         }
     }
@@ -249,7 +304,10 @@ async function waitForExportResult(ticket, token, obj_type) {
     }
     
     console.warn('[waitForExportResult] failed to get export result after multiple retries');
-    return null;
+    if (lastError) {
+        throw new Error(`导出失败：${lastError}`);
+    }
+    throw new Error(`导出超时：等待约 ${maxRetries} 秒后飞书仍未生成导出文件（文件可能较大，可稍后单独重试）`);
 }
 
 // 获取我的空间文件列表
@@ -272,18 +330,86 @@ async function getJson(url) {
     }
 }
 
+// 获取列表接口的全部分页：飞书列表接口每次最多返回一页，
+// 通过 data.has_more 判断是否还有下一页，并用 data.last_label 作为游标继续请求。
+// 返回值与单页接口结构相同（data.node_list + data.entities.nodes），合并了所有分页。
+async function getJsonAllPages(url) {
+    const nodeList = [];
+    const seenIds = new Set();
+    const nodes = {};
+    const seenLabels = new Set();
+    let lastLabel = '';
+    let firstJson = null;
+    
+    for (let page = 0; page < 1000; page++) {
+        if (page > 0) {
+            await sleep(300); // 避免请求过快
+        }
+        const pageUrl = lastLabel
+            ? `${url}${url.includes('?') ? '&' : '?'}last_label=${encodeURIComponent(lastLabel)}`
+            : url;
+        const json = await getJson(pageUrl);
+        if (!firstJson) firstJson = json;
+        
+        const data = json && json.data;
+        if (!data || !data.node_list) break;
+        
+        const pageNodes = (data.entities && data.entities.nodes) || {};
+        for (const id of data.node_list) {
+            if (!seenIds.has(id)) {
+                seenIds.add(id);
+                nodeList.push(id);
+            }
+        }
+        Object.assign(nodes, pageNodes);
+        
+        // 没有下一页，或游标重复（防止死循环）时结束
+        if (!data.has_more || !data.last_label || seenLabels.has(data.last_label)) break;
+        seenLabels.add(data.last_label);
+        lastLabel = data.last_label;
+        console.log(`[getJsonAllPages] 继续获取下一页 (第 ${page + 2} 页): ${url}`);
+    }
+    
+    if (!firstJson || !firstJson.data) return firstJson;
+    return {
+        ...firstJson,
+        data: {
+            ...firstJson.data,
+            node_list: nodeList,
+            entities: { ...(firstJson.data.entities || {}), nodes }
+        }
+    };
+}
+
 // 递归获取文件夹中的文件和子文件夹（返回树形结构）
-async function getFileListFromFolder(obj_token, parentPath = '', parentToken = '') {
+// 获取文件列表的扫描进度，通过 fileListProgress 事件通知 panel.js
+const scanProgress = {
+    topDone: 0,      // 已扫描完的顶层文件夹数
+    topTotal: 0,     // 顶层文件夹总数（我的文件夹 + 共享文件夹）
+    folders: 0,      // 已扫描的文件夹数（含子文件夹）
+    files: 0,        // 已发现的文件数
+    currentPath: ''  // 正在扫描的文件夹路径
+};
+
+function reportScanProgress(patch = {}) {
+    Object.assign(scanProgress, patch);
+    window.dispatchEvent(new CustomEvent('fileListProgress', { detail: { ...scanProgress } }));
+}
+
+// ancestors：当前路径上所有上级文件夹的 token，用于发现循环引用
+// （例如文件夹里有一个指向自己上级文件夹的快捷方式，会导致无限递归）
+async function getFileListFromFolder(obj_token, parentPath = '', parentToken = '', ancestors = new Set()) {
     const files = [];
     const folders = [];
     
     try {
+        reportScanProgress({ currentPath: parentPath });
         await sleep(300); // 避免请求过快
         const url = obj_token 
             ? `${window.location.origin}/space/api/explorer/v3/children/list/?asc=1&rank=5&token=${obj_token}`
             : `${window.location.origin}/space/api/explorer/v3/my_space/obj/`;
         
-        const json = await getJson(url);
+        const json = await getJsonAllPages(url);
         
         if (json && json.data && json.data.node_list) {
             for (const nodeId of json.data.node_list) {
@@ -302,7 +428,14 @@ async function getFileListFromFolder(obj_token, parentPath = '', parentToken = '
                         children: []
                     };
                     
-                    const subResult = await getFileListFromFolder(node.obj_token, folderPath, node.obj_token);
+                    if (node.obj_token === obj_token || ancestors.has(node.obj_token)) {
+                        console.warn(`[getFileListFromFolder] 跳过循环引用的文件夹: ${folderPath}`);
+                        continue;
+                    }
+                    
+                    const subResult = await getFileListFromFolder(
+                        node.obj_token, folderPath, node.obj_token, new Set([...ancestors, obj_token])
+                    );
                     folderData.children = [...subResult.folders, ...subResult.files];
                     folders.push(folderData);
                 } else {
@@ -317,9 +450,12 @@ async function getFileListFromFolder(obj_token, parentPath = '', parentToken = '
                         type: 'file',
                         sourceRoot: parentPath.startsWith('共享文件夹') ? 'shared' : 'my' // 标识文件来源
                     });
+                    scanProgress.files++;
                 }
             }
         }
+        scanProgress.folders++;
+        reportScanProgress();
     } catch (error) {
         console.error(`[getFileListFromFolder] 获取文件夹 ${obj_token} 的文件列表失败:`, error);
     }
@@ -333,6 +469,10 @@ async function getAllFiles() {
     
     const allFiles = [];
     const allFolders = [];
+    // 先拿到所有顶层文件夹，以便计算整体进度
+    const topFolders = []; // { folder, rootName, parentToken }
+    
+    reportScanProgress({ topDone: 0, topTotal: 0, folders: 0, files: 0, currentPath: '顶层文件夹列表' });
     
     try {
         // 1. 获取我的空间数据
@@ -340,32 +480,20 @@ async function getAllFiles() {
         try {
             // 获取我的空间文件夹列表
             await sleep(500);
-            const myFoldersJson = await getJson(`${window.location.origin}/space/api/explorer/v3/my_space/folder/?asc=1&rank=5&length=50`);
+            const myFoldersJson = await getJsonAllPages(`${window.location.origin}/space/api/explorer/v3/my_space/folder/?asc=1&rank=5&length=50`);
             
             if (myFoldersJson && myFoldersJson.data && myFoldersJson.data.node_list) {
                 for (const token of myFoldersJson.data.node_list) {
                     const folder = myFoldersJson.data.entities.nodes[token];
                     if (folder && folder.obj_token && folder.name) {
-                        const folderData = {
-                            obj_token: folder.obj_token,
-                            name: folder.name,
-                            path: `我的文件夹/${folder.name}`,
-                            parentToken: 'virtual_my_files',
-                            type: 'folder',
-                            children: []
-                        };
-                        
-                        const subResult = await getFileListFromFolder(folder.obj_token, `我的文件夹/${folder.name}`, folder.obj_token);
-                        folderData.children = [...subResult.folders, ...subResult.files];
-                        allFolders.push(folderData);
-                        // 不在这里添加文件，因为文件已经在children中了
+                        topFolders.push({ folder, rootName: '我的文件夹', parentToken: 'virtual_my_files' });
                     }
                 }
             }
             
             // 获取我的空间根目录文件（只获取根目录下的直接文件，不递归）
             await sleep(300);
-            const rootJson = await getJson(`${window.location.origin}/space/api/explorer/v3/my_space/obj/`);
+            const rootJson = await getJsonAllPages(`${window.location.origin}/space/api/explorer/v3/my_space/obj/`);
             if (rootJson && rootJson.data && rootJson.data.node_list) {
                 const rootFiles = [];
                 for (const nodeId of rootJson.data.node_list) {
@@ -385,34 +513,23 @@ async function getAllFiles() {
                     }
                 }
                 allFiles.push(...rootFiles);
+                reportScanProgress({ files: scanProgress.files + rootFiles.length });
             }
         } catch (error) {
             console.error('[getAllFiles] 加载我的空间数据时出错:', error);
         }
         
-        // 2. 获取共享空间数据
+        // 2. 获取共享空间文件夹列表
         console.log('[getAllFiles] 开始加载共享空间数据...');
         try {
             await sleep(500);
-            const shareFoldersJson = await getJson(`${window.location.origin}/space/api/explorer/v2/share/folder/list/?asc=0&rank=3&hidden=0&length=50`);
+            const shareFoldersJson = await getJsonAllPages(`${window.location.origin}/space/api/explorer/v2/share/folder/list/?asc=0&rank=3&hidden=0&length=50`);
             
             if (shareFoldersJson && shareFoldersJson.data && shareFoldersJson.data.node_list) {
                 for (const token of shareFoldersJson.data.node_list) {
                     const folder = shareFoldersJson.data.entities.nodes[token];
                     if (folder && folder.obj_token && folder.name) {
-                        const folderData = {
-                            obj_token: folder.obj_token,
-                            name: folder.name,
-                            path: `共享文件夹/${folder.name}`,
-                            parentToken: 'virtual_shared_files',
-                            type: 'folder',
-                            children: []
-                        };
-                        
-                        const subResult = await getFileListFromFolder(folder.obj_token, `共享文件夹/${folder.name}`, folder.obj_token);
-                        folderData.children = [...subResult.folders, ...subResult.files];
-                        allFolders.push(folderData);
-                        // 不在这里添加文件，因为文件已经在children中了
+                        topFolders.push({ folder, rootName: '共享文件夹', parentToken: 'virtual_shared_files' });
                     }
                 }
             }
@@ -420,7 +537,32 @@ async function getAllFiles() {
             console.error('[getAllFiles] 加载共享空间数据时出错:', error);
         }
         
+        // 3. 逐个递归扫描顶层文件夹
+        reportScanProgress({ topTotal: topFolders.length });
+        for (const { folder, rootName, parentToken } of topFolders) {
+            const folderPath = `${rootName}/${folder.name}`;
+            try {
+                const folderData = {
+                    obj_token: folder.obj_token,
+                    name: folder.name,
+                    path: folderPath,
+                    parentToken: parentToken,
+                    type: 'folder',
+                    children: []
+                };
+                
+                const subResult = await getFileListFromFolder(folder.obj_token, folderPath, folder.obj_token);
+                folderData.children = [...subResult.folders, ...subResult.files];
+                allFolders.push(folderData);
+                // 不在这里添加文件，因为文件已经在children中了
+            } catch (error) {
+                console.error(`[getAllFiles] 扫描文件夹 ${folderPath} 时出错:`, error);
+            }
+            reportScanProgress({ topDone: scanProgress.topDone + 1 });
+        }
+        
         // 构建树形结构
+        reportScanProgress({ currentPath: '' });
         const treeData = buildTreeStructure(allFiles, allFolders);
         
         console.log('[getAllFiles] 获取完成，文件:', allFiles.length, '个，文件夹:', allFolders.length, '个');
@@ -680,6 +822,10 @@ function createPanel() {
         <div id="loading" class="loading" style="display: none;">
             <div class="spinner"></div>
             <span id="loadingText">正在处理...</span>
+            <div id="loadingProgress" class="progress-bar" style="display: none;">
+                <div id="loadingProgressFill" class="progress-bar-fill"></div>
+            </div>
+            <div id="loadingDetail" class="loading-detail"></div>
         </div>
         
         <div id="result" class="result-container" style="display: none;">
